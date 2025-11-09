@@ -58,9 +58,11 @@ interface PlayerConnection {
   ws: WebSocket;
   lastInput: Input;
   lastProcessedSeq: number;
-  lastShootTime: number;
   camera: CameraView;
   visibleCells: Set<string>;
+  lastMessageTime: number;
+  messageCount: number;
+  actionCooldowns: Map<string, number>;
 }
 
 // ==================== DELTA MESSAGE POOL ====================
@@ -148,6 +150,15 @@ const DEFAULT_CAMERA_HEIGHT = 1080;
 const FULL_STATE_INTERVAL = 60; // ticks (send full state every 2 seconds)
 const REAPER_DELAY = 5000; // ms (time dead bodies stay)
 
+const SHOOT_COOLDOWN_TOLERANCE = 0.8;
+const MAX_MESSAGES_PER_SECOND = 60;
+const PACKET_MAX_SIZE = 1024;
+
+const MIN_CAMERA_WIDTH = 640;
+const MAX_CAMERA_WIDTH = 7680;
+const MIN_CAMERA_HEIGHT = 480;
+const MAX_CAMERA_HEIGHT = 4320;
+
 // ==================== HELPERS ====================
 function hashEntity(entity: any, type: 'player' | 'projectile'): string {
   if (type === 'player') {
@@ -211,6 +222,19 @@ function buildEntityCellCache() {
   });
 }
 
+function cleanupPlayer(playerId: string): void {
+  gameState.delete(playerId);
+  connections.delete(playerId);
+  
+  const snapshot = playerSnapshots.get(playerId);
+  if (snapshot) {
+    snapshotPool.release(snapshot);
+    playerSnapshots.delete(playerId);
+  }
+  
+  projectilePool.clearByOwner(playerId);
+}
+
 // ==================== WEBSOCKET SERVER ====================
 const wss = new WebSocketServer({ port: 8080 });
 
@@ -234,14 +258,16 @@ wss.on('connection', (ws) => {
     ws: ws,
     lastInput: { w: false, a: false, s: false, d: false },
     lastProcessedSeq: -1,
-    lastShootTime: 0,
     camera: {
       x: 0,
       y: 0,
       width: DEFAULT_CAMERA_WIDTH,
       height: DEFAULT_CAMERA_HEIGHT
     },
-    visibleCells: new Set()
+    visibleCells: new Set(),
+    lastMessageTime: Date.now(),
+    messageCount: 0,
+    actionCooldowns: new Map<string, number>()
   });
 
   playerSnapshots.set(playerId, snapshotPool.acquire());
@@ -251,24 +277,87 @@ wss.on('connection', (ws) => {
   ws.send(binaryWelcomeMessage);
 
   ws.on('message', (message) => {
+    const connection = connections.get(playerId);
+    if (!connection) return;
+
+    if ((message as Buffer).length > PACKET_MAX_SIZE) {
+      console.warn(`Player ${playerId} sent oversized packet. Disconnecting.`);
+      ws.close(1009, 'Packet too large');
+      return;
+    }
+
+    const now = Date.now();
+    const timeDiff = now - connection.lastMessageTime;
+
+    if (timeDiff < 1000) {
+      connection.messageCount++;
+      if (connection.messageCount > MAX_MESSAGES_PER_SECOND) {
+        console.warn(`Player ${playerId} is sending messages too quickly. Disconnecting.`);
+        ws.close(1008, 'Rate limit exceeded');
+        return;
+      }
+    } else {
+      connection.lastMessageTime = now;
+      connection.messageCount = 1;
+    }
+
     try {
       const data = decode(message as Buffer) as any;
 
-      const connection = connections.get(playerId);
-      if (!connection) return;
-
+      if (!data.type || typeof data.type !== 'string') return;
+      
       if (data.type === 'input') {
+        if (
+          !data.keys || 
+          typeof data.keys.w !== 'boolean' ||
+          typeof data.keys.a !== 'boolean' ||
+          typeof data.keys.s !== 'boolean' ||
+          typeof data.keys.d !== 'boolean'
+        ) return;
+
         const inputData = data as InputPacket;
         connection.lastInput = inputData.keys;
         connection.lastProcessedSeq = inputData.seq;
       }
 
       if (data.type === 'shoot') {
+        if (
+          typeof data.angle !== 'number' || 
+          isNaN(data.angle) ||
+          data.angle < -Math.PI || 
+          data.angle > Math.PI
+        ) return;
+
         const shootData = data as ShootPacket;
         handleShoot(playerId, shootData.angle);
       }
 
       if (data.type === 'camera') {
+        if (
+          typeof data.x !== 'number' || 
+          typeof data.y !== 'number' ||
+          typeof data.width !== 'number' || 
+          typeof data.height !== 'number' ||
+          isNaN(data.x) || 
+          isNaN(data.y) || 
+          isNaN(data.width) || 
+          isNaN(data.height)
+        ) return;
+
+        if (
+          data.width < MIN_CAMERA_WIDTH || 
+          data.width > MAX_CAMERA_WIDTH ||
+          data.height < MIN_CAMERA_HEIGHT || 
+          data.height > MAX_CAMERA_HEIGHT
+        ) return;
+
+        const margin = 10000;
+        if (
+          data.x < -margin || data.x > WORLD_WIDTH + margin ||
+          data.y < -margin || data.y > WORLD_HEIGHT + margin
+        ) return;
+
+
         const cameraData = data as CameraPacket;
         const connection = connections.get(playerId);
         if (connection) {
@@ -287,16 +376,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    gameState.delete(playerId); 
-    connections.delete(playerId);
-
-    const snapshot = playerSnapshots.get(playerId);
-    if (snapshot) {
-      snapshotPool.release(snapshot);
-      playerSnapshots.delete(playerId);
-    }
-    
-    projectilePool.clearByOwner(playerId);
+    cleanupPlayer(playerId);
   });
 
   ws.on('error', (error) => {
@@ -312,12 +392,19 @@ function handleShoot(playerId: string, angle: number): void {
   if (!connection || !player || player.isDead) return;
 
   const now = Date.now();
+
+  const action = 'primary_fire';
+  const cooldown = SHOOT_COOLDOWN;
+
+  const nextReadyTime = connection.actionCooldowns.get(action) || 0;
+
+  const minReadyTime = nextReadyTime - (cooldown * (1 - SHOOT_COOLDOWN_TOLERANCE));
   
-  if (now - connection.lastShootTime < SHOOT_COOLDOWN) return;
+  if (now < minReadyTime) return;
+
+  connection.actionCooldowns.set(action, now + cooldown);
 
   if (!projectilePool.canShoot(playerId)) return;
-
-  connection.lastShootTime = now;
 
   const projId = `${playerId}-${now}`;
   const playerCenterX = player.x + player.width / 2;
@@ -730,7 +817,7 @@ function spawnBot(id: number) {
   botWs.on('error', (error) => console.log(`🤖 Bot ${id} erro: ${error.message}`));
 }
 
-const NUM_BOTS = 1000;
-for (let i = 0; i < NUM_BOTS; i++) {
-  spawnBot(i);
-}
+// const NUM_BOTS = 1000;
+// for (let i = 0; i < NUM_BOTS; i++) {
+//   spawnBot(i);
+// }
