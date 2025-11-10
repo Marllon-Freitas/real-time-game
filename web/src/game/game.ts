@@ -12,7 +12,8 @@ import { Player } from "./player";
 import { InputManager } from "../input/inputManager";
 import { Projectile } from "./projectile";
 import { Camera } from "./camera";
-import type { HUDData, PlayerState } from "../types";
+import type { HUDData, PendingInput, PlayerState } from "../types";
+import { lerp } from "../utils/math";
 
 export class Game {
   private canvas: HTMLCanvasElement;
@@ -25,11 +26,18 @@ export class Game {
   private hud: HUD;
   private network: NetworkClient;
 
+  private serverStateBuffer: { state: PlayerState, seq: number }[] = [];
+
+  private lastPlayerState: PlayerState;
+  private currentPlayerState: PlayerState;
+
   private localProjectiles: Projectile[] = [];
   private lastShootTime = 0;
   
   private running = false;
   private lastTime = 0;
+
+  private physicsAccumulator = 0;
 
   private frameCount = 0;
   private fps = 0;
@@ -50,15 +58,11 @@ export class Game {
     this.hud = new HUD(this.ctx);
     this.network = new NetworkClient();
 
-    this.network.onReconciliation((serverState: PlayerState) => {
-      this.player.setState(serverState);
+    this.lastPlayerState = this.player.getState();
+    this.currentPlayerState = this.player.getState();
 
-      const pendingInputs = this.network.getPendingInputs();
-      pendingInputs.forEach(input => {
-        if (!this.player.isDead) {
-          this.player.applyInput(input.keys, TICK_INTERVAL / 1000, WORLD_WIDTH, WORLD_HEIGHT);
-        }
-      });
+    this.network.onReconciliation((serverState: PlayerState, lastProcessedSeq: number) => {
+      this.serverStateBuffer.push({ state: serverState, seq: lastProcessedSeq });
     });
   }
 
@@ -81,44 +85,86 @@ export class Game {
 
     const deltaTime = (currentTime - this.lastTime) / 1000;
     this.lastTime = currentTime;
+    
+    const fixedDeltaTime = TICK_INTERVAL / 1000;
+    this.physicsAccumulator += deltaTime;
+
+    while (this.physicsAccumulator >= fixedDeltaTime) {
+      this.fixedUpdate(fixedDeltaTime);
+      this.physicsAccumulator -= fixedDeltaTime;
+    }
+
+    const interpolationAlpha = this.physicsAccumulator / fixedDeltaTime;
+
+    const renderState: PlayerState = {
+      ...this.currentPlayerState,
+      x: lerp(this.lastPlayerState.x, this.currentPlayerState.x, interpolationAlpha),
+      y: lerp(this.lastPlayerState.y, this.currentPlayerState.y, interpolationAlpha),
+    };
 
     this.updateFPS();
-    this.update(deltaTime);
-    this.render();
+    this.update(renderState, deltaTime);
+    this.render(renderState, currentTime);
 
     requestAnimationFrame(this.gameLoop);
   };
 
-  private update(deltaTime: number): void {
-    const input = this.inputManager.getInput();
+  private update(renderState: PlayerState, deltaTime: number,): void {
+    this.camera.update(renderState, deltaTime);
+  }
 
-    if (!this.player.isDead) {
-      this.player.applyInput(input, deltaTime, WORLD_WIDTH, WORLD_HEIGHT);
-    }
+private fixedUpdate(fixedDeltaTime: number): void {
+  let latestServerState: PlayerState | null = null;
+  let lastProcessedSeq = -1;
 
-    this.camera.follow(this.player.getState());
+  while (this.serverStateBuffer.length > 0) {
+    const { state, seq } = this.serverStateBuffer.shift()!;
+    latestServerState = state;
+    lastProcessedSeq = seq;
+  }
 
-    this.network.sendCameraPosition(
-      this.camera.x,
-      this.camera.y,
-      this.camera.width,
-      this.camera.height
-    );
-    this.network.sendInput(input);
+  if (latestServerState) {
+    this.player.setState(latestServerState);
+    this.network.removeAcknowledgedInputs(lastProcessedSeq);
 
-    if (!this.player.isDead && this.inputManager.isMouseDown() && this.canShoot()) {
-      this.shoot();
-    }
-
-    for (let i = this.localProjectiles.length - 1; i >= 0; i--) {
-      const proj = this.localProjectiles[i];
-      proj.update(deltaTime);
-
-      if (proj.isOutOfBounds(WORLD_WIDTH, WORLD_HEIGHT)) {
-        this.localProjectiles.splice(i, 1);
+    const pendingInputs = this.network.getPendingInputs();
+    pendingInputs.forEach((input: PendingInput) => {
+      if (!this.player.isDead) {
+        this.player.applyInput(input.keys, fixedDeltaTime, WORLD_WIDTH, WORLD_HEIGHT);
       }
+    });
+  }
+
+  this.lastPlayerState = this.player.getState();
+
+  const input = this.inputManager.getInput();
+  if (!this.player.isDead) {
+    this.player.applyInput(input, fixedDeltaTime, WORLD_WIDTH, WORLD_HEIGHT);
+  }
+
+  this.currentPlayerState = this.player.getState();
+  
+  this.network.sendInput(input);
+  this.network.sendCameraPosition(
+    this.camera.x,
+    this.camera.y,
+    this.camera.width,
+    this.camera.height
+  );
+
+  if (!this.player.isDead && this.inputManager.isMouseDown() && this.canShoot()) {
+    this.shoot();
+  }
+
+  for (let i = this.localProjectiles.length - 1; i >= 0; i--) {
+    const proj = this.localProjectiles[i];
+    proj.update(fixedDeltaTime);
+
+    if (proj.isOutOfBounds(WORLD_WIDTH, WORLD_HEIGHT)) {
+      this.localProjectiles.splice(i, 1);
     }
   }
+}
 
   private canShoot(): boolean {
     const now = Date.now();
@@ -151,13 +197,14 @@ export class Game {
     this.network.sendShoot(angle);
   }
 
-  private render(): void {
+  private render(localPlayerRenderState: PlayerState, currentTime: number): void {
     this.renderer.clear(this.canvas.width, this.canvas.height);
     this.renderer.beginScene(this.camera);
 
     this.renderer.drawGrid(this.canvas.width, this.canvas.height);
 
-    const { players: interpolatedPlayers, interpTargetDelay, currentDelay } = this.network.stateBuffer.getInterpolatedPlayers();
+    const { players: interpolatedPlayers, interpTargetDelay, currentDelay } =
+    this.network.stateBuffer.getInterpolatedPlayers(currentTime);
     
     interpolatedPlayers.forEach((player, playerId) => {
       if (this.camera.isVisible(player)) {
@@ -165,7 +212,7 @@ export class Game {
       }
     });
 
-    const interpolatedProjectiles = this.network.stateBuffer.getInterpolatedProjectiles();
+    const interpolatedProjectiles = this.network.stateBuffer.getInterpolatedProjectiles(currentTime);
     interpolatedProjectiles.forEach(proj => {
       if (this.camera.isVisible({
         x: proj.x - proj.radius,
@@ -188,7 +235,7 @@ export class Game {
     //   }
     // });
 
-    this.renderer.drawLocalPlayer(this.player.getState());
+    this.renderer.drawLocalPlayer(localPlayerRenderState);
     this.renderer.drawCrosshair(this.inputManager.getMousePosition().x, this.inputManager.getMousePosition().y);
     
     const hudData: HUDData = {

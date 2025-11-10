@@ -138,8 +138,12 @@ export class StateBuffer {
     };
   }
 
-  getInterpolatedPlayers(): { players: Map<string, PlayerState>; interpTargetDelay: number; currentDelay: number } {
-    const now = Date.now();
+  getInterpolatedPlayers(nowTimestamp?: number): { 
+    players: Map<string, PlayerState>; 
+    interpTargetDelay: number; 
+    currentDelay: number 
+  } {
+    const now = nowTimestamp !== undefined ? nowTimestamp : performance.now();
     const renderTime = now - this.currentInterpolationDelay;
     const [before, after] = this.findBracketingStates(renderTime);
 
@@ -204,8 +208,8 @@ export class StateBuffer {
     };
   }
 
-  getInterpolatedProjectiles(): Map<string, ProjectileState> {
-    const now = Date.now();
+  getInterpolatedProjectiles(nowTimestamp?: number): Map<string, ProjectileState> {
+    const now = nowTimestamp !== undefined ? nowTimestamp : performance.now();
     const renderTime = now - this.currentInterpolationDelay;
     const [before, after] = this.findBracketingStates(renderTime);
 

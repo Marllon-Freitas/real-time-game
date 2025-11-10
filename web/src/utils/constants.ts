@@ -13,6 +13,8 @@ export const WORLD_HEIGHT = 10000;
 export const GRID_SIZE = 50;
 export const HUD_MARGIN = 10;
 
+export const CAMERA_FOLLOW_SPEED = 15.0;
+
 // === Network ===
 // (Units in milliseconds)
 export const SERVER_URL = 'ws://localhost:8080';

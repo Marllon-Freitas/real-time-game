@@ -256,17 +256,18 @@ function handleShoot(playerId: string, angle: number): void {
   if (!connection || !player || player.isDead) return;
 
   const now = Date.now();
-
   const action = 'primary_fire';
   const cooldown = SHOOT_COOLDOWN;
 
-  const nextReadyTime = connection.actionCooldowns.get(action) || 0;
+  const lastReadyTime = connection.actionCooldowns.get(action) || 0;
 
-  const minReadyTime = nextReadyTime - (cooldown * (1 - SHOOT_COOLDOWN_TOLERANCE));
+  const minReadyTime = lastReadyTime - (cooldown * (1 - SHOOT_COOLDOWN_TOLERANCE));
   
   if (now < minReadyTime) return;
 
-  connection.actionCooldowns.set(action, now + cooldown);
+  const newReadyTime = Math.max(now, lastReadyTime) + cooldown;
+
+  connection.actionCooldowns.set(action, newReadyTime);
 
   if (!projectilePool.canShoot(playerId)) return;
 
@@ -332,6 +333,8 @@ function gameLoop() {
 
   let collisionCheckCount = 0;
 
+  const fixedDeltaTime = TICK_INTERVAL / 1000;
+
   // ==================== 1. PHYSICS ====================
   playerGrid.clear();
   projectileGrid.clear();
@@ -340,7 +343,7 @@ function gameLoop() {
     const player = gameState.get(playerId);
     if (!player || player.isDead) return;
 
-    applyInput(player, connection.lastInput, deltaTime);
+    applyInput(player, connection.lastInput, fixedDeltaTime);
 
     const playerKey = getGridKey(player.x, player.y);
     playerGrid.add(playerKey, playerId);
@@ -352,7 +355,7 @@ function gameLoop() {
   const projectilesToDelete = new Set<string>();
 
   projectilePool.forEach((proj, projId) => {
-    proj.update(deltaTime);
+    proj.update(fixedDeltaTime);
 
     if (proj.isOutOfBounds(WORLD_WIDTH, WORLD_HEIGHT)) {
       projectilesToDelete.add(projId);
@@ -521,6 +524,7 @@ function gameLoop() {
 
     const deltaMessage = {
       type: 'gameStateDelta',
+      timestamp: Date.now(),
       tick: tickCount,
       isFullState: isFullStateFrame,
       lastProcessedInput: connection.lastProcessedSeq,
