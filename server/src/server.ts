@@ -6,110 +6,41 @@ import { GridCellPool, PooledSpatialGrid } from './game/gridPool';
 import { circleRectAABBCollision } from './utils/collision';
 import { PlayerSnapshotPool } from './game/snapshotPool';
 import { ProjectilePool } from './game/projectilePool';
-
-// ==================== INTERFACES ====================
-interface PlayerState {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  health: number;
-  maxHealth: number;
-  isDead: boolean;
-  timeOfDeath: number;
-}
-
-interface Input {
-  w: boolean;
-  a: boolean;
-  s: boolean;
-  d: boolean;
-}
-
-interface InputPacket {
-  type: 'input';
-  seq: number;
-  keys: Input;
-  timestamp: number;
-}
-
-interface ShootPacket {
-  type: 'shoot';
-  angle: number;
-  timestamp: number;
-}
-
-interface CameraPacket {
-  type: 'camera';
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-interface CameraView {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-interface PlayerConnection {
-  ws: WebSocket;
-  lastInput: Input;
-  lastProcessedSeq: number;
-  camera: CameraView;
-  visibleCells: Set<string>;
-  lastMessageTime: number;
-  messageCount: number;
-  actionCooldowns: Map<string, number>;
-}
-
-// ==================== DELTA MESSAGE POOL ====================
-interface EntitySnapshot {
-  state: any;
-  hash: string;
-}
-
-interface PlayerSnapshot {
-  players: Map<string, EntitySnapshot>;
-  projectiles: Map<string, EntitySnapshot>;
-}
-
-class MessagePool {
-  private deltaPlayersPool: Record<string, PlayerState>[] = [];
-  private deltaProjectilesPool: Record<string, any>[] = [];
-  private deletedArrayPool: string[][] = [];
-
-  acquireDeltaPlayers(): Record<string, PlayerState> {
-    return this.deltaPlayersPool.pop() || {};
-  }
-
-  releaseDeltaPlayers(obj: Record<string, PlayerState>) {
-    for (const key in obj) delete obj[key];
-    this.deltaPlayersPool.push(obj);
-  }
-
-  acquireDeltaProjectiles(): Record<string, any> {
-    return this.deltaProjectilesPool.pop() || {};
-  }
-
-  releaseDeltaProjectiles(obj: Record<string, any>) {
-    for (const key in obj) delete obj[key];
-    this.deltaProjectilesPool.push(obj);
-  }
-
-  acquireDeletedArray(): string[] {
-    const arr = this.deletedArrayPool.pop() || [];
-    arr.length = 0;
-    return arr;
-  }
-
-  releaseDeletedArray(arr: string[]) {
-    arr.length = 0;
-    this.deletedArrayPool.push(arr);
-  }
-}
+import { MessagePool } from './game/messagePool';
+import { 
+  getGridKey,
+  getNeighborKeys,
+  hashEntity,
+  updateVisibleCells
+} from './utils/helpers';
+import type { 
+  CameraPacket,
+  Input,
+  InputPacket,
+  PlayerConnection,
+  PlayerSnapshot,
+  PlayerState,
+  ShootPacket
+} from './types';
+import {
+  DEFAULT_CAMERA_HEIGHT,
+  DEFAULT_CAMERA_WIDTH,
+  FULL_STATE_INTERVAL,
+  MAX_CAMERA_HEIGHT,
+  MAX_CAMERA_WIDTH,
+  MAX_MESSAGES_PER_SECOND,
+  MIN_CAMERA_HEIGHT,
+  MIN_CAMERA_WIDTH,
+  PACKET_MAX_SIZE,
+  PLAYER_SPEED,
+  REAPER_DELAY,
+  SHOOT_COOLDOWN,
+  SHOOT_COOLDOWN_TOLERANCE,
+  TICK_INTERVAL,
+  TICK_RATE,
+  WORLD_HEIGHT,
+  WORLD_WIDTH
+} from './constants';
 
 // ==================== GLOBAL GAME STATE ====================
 const gameState = new Map<string, PlayerState>();
@@ -132,74 +63,7 @@ const entityCellCache = new Map<string, {
   projectiles: Set<string>
 }>();
 
-// ==================== CONSTANTS ====================
-const WORLD_WIDTH = 10000;
-const WORLD_HEIGHT = 10000;
-const PLAYER_SPEED = 300; // px/s
-const TICK_RATE = 30; // TPS
-const TICK_INTERVAL = 1000 / TICK_RATE; // ms
-const SHOOT_COOLDOWN = 200; // ms
-
-// Spatial Grid
-const CELL_SIZE = 200; // px
-const CAMERA_PADDING = 100; // px
-const DEFAULT_CAMERA_WIDTH = 1920;
-const DEFAULT_CAMERA_HEIGHT = 1080;
-
-// Sync
-const FULL_STATE_INTERVAL = 60; // ticks (send full state every 2 seconds)
-const REAPER_DELAY = 5000; // ms (time dead bodies stay)
-
-const SHOOT_COOLDOWN_TOLERANCE = 0.8;
-const MAX_MESSAGES_PER_SECOND = 60;
-const PACKET_MAX_SIZE = 1024;
-
-const MIN_CAMERA_WIDTH = 640;
-const MAX_CAMERA_WIDTH = 7680;
-const MIN_CAMERA_HEIGHT = 480;
-const MAX_CAMERA_HEIGHT = 4320;
-
 // ==================== HELPERS ====================
-function hashEntity(entity: any, type: 'player' | 'projectile'): string {
-  if (type === 'player') {
-    return `${entity.x.toFixed(2)}|${entity.y.toFixed(2)}|${entity.health}|${entity.isDead}`;
-  } else {
-    return `${entity.x.toFixed(2)}|${entity.y.toFixed(2)}`;
-  }
-}
-
-function getGridKey(x: number, y: number): string {
-  const col = Math.floor(x / CELL_SIZE);
-  const row = Math.floor(y / CELL_SIZE);
-  return `${col}_${row}`;
-}
-
-function getNeighborKeys(col: number, row: number): string[] {
-  const keys: string[] = [];
-  for (let x = col - 1; x <= col + 1; x++) {
-    for (let y = row - 1; y <= row + 1; y++) {
-      keys.push(`${x}_${y}`);
-    }
-  }
-  return keys;
-}
-
-function updateVisibleCells(camera: CameraView): Set<string> {
-  const padding = CAMERA_PADDING;
-  const startCol = Math.floor((camera.x - padding) / CELL_SIZE);
-  const endCol = Math.ceil((camera.x + camera.width + padding) / CELL_SIZE);
-  const startRow = Math.floor((camera.y - padding) / CELL_SIZE);
-  const endRow = Math.ceil((camera.y + camera.height + padding) / CELL_SIZE);
-
-  const cells = new Set<string>();
-  for (let col = startCol; col <= endCol; col++) {
-    for (let row = startRow; row <= endRow; row++) {
-      cells.add(`${col}_${row}`);
-    }
-  }
-  return cells;
-}
-
 function buildEntityCellCache() {
   entityCellCache.clear();
 
@@ -716,7 +580,7 @@ function gameLoop() {
   tickCount++;
   
   // ==================== PERFORMANCE LOGGING ====================
-  if (tickCount % (TICK_RATE * 5) === 0) {
+  if (tickCount % (TICK_RATE * 3) === 0) {
     const projStats = projectilePool.getStats();
     const gridStats = gridCellPool.getStats();
     const snapStats = snapshotPool.getStats();
@@ -759,11 +623,8 @@ function gameLoop() {
     console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
   }
 }
-// ==================== INICIAR SERVIDOR ====================
 
 setInterval(gameLoop, TICK_INTERVAL);
-
-console.log(`Server started on ws://localhost:8080 (Tick Rate: ${TICK_RATE} TPS / ${TICK_INTERVAL.toFixed(2)}ms)`);
 
 function spawnBot(id: number) {
   const botWs = new WebSocket('ws://localhost:8080');
@@ -780,15 +641,15 @@ function spawnBot(id: number) {
       else input.d = true;
     }, 2000);
 
-    setInterval(() => {
-      if (botWs.readyState === WebSocket.OPEN) { 
-        botWs.send(encode({
-          type: 'shoot',
-          angle: Math.random() * 2 * Math.PI,
-          timestamp: Date.now()
-        }));
-      }
-    }, 500);
+    // setInterval(() => {
+    //   if (botWs.readyState === WebSocket.OPEN) { 
+    //     botWs.send(encode({
+    //       type: 'shoot',
+    //       angle: Math.random() * 2 * Math.PI,
+    //       timestamp: Date.now()
+    //     }));
+    //   }
+    // }, 500);
 
     setInterval(() => {
       if (botWs.readyState === WebSocket.OPEN) {
@@ -811,13 +672,11 @@ function spawnBot(id: number) {
     } catch (e) {
     }
   });
-
-  botWs.on('close', () => console.log(`🤖 Bot ${id} desconectado.`));
   
-  botWs.on('error', (error) => console.log(`🤖 Bot ${id} erro: ${error.message}`));
+  botWs.on('error', (error) => console.log(`Bot ${id} erro: ${error.message}`));
 }
 
-// const NUM_BOTS = 1000;
-// for (let i = 0; i < NUM_BOTS; i++) {
-//   spawnBot(i);
-// }
+const NUM_BOTS = 100;
+for (let i = 0; i < NUM_BOTS; i++) {
+  spawnBot(i);
+}
