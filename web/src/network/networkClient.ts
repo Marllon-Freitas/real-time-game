@@ -18,8 +18,11 @@ export class NetworkClient {
 
   public stateBuffer = new StateBuffer();
 
+  private clockOffset = 0;
+  private clockSynced = false;
+
   private onPlayerIdCallback?: (id: string) => void;
-  private onReconciliationCallback?: (serverState: PlayerState) => void;
+  private onReconciliationCallback?: (serverState: PlayerState, lastProcessedSeq: number) => void;
 
   constructor() {
     this.connect();
@@ -29,7 +32,9 @@ export class NetworkClient {
     this.ws = new WebSocket(SERVER_URL);
     this.ws.binaryType = 'arraybuffer';
 
-    this.ws.onopen = () => {};
+    this.ws.onopen = () => {
+      this.clockSynced = false;
+    };
 
     this.ws.onmessage = (event) => {
       try {
@@ -43,6 +48,7 @@ export class NetworkClient {
     this.ws.onclose = () => {
       this.myPlayerId = null;
       this.stateBuffer.clear();
+      this.clockSynced = false;
       setTimeout(() => this.connect(), 2000);
     };
 
@@ -65,23 +71,31 @@ export class NetworkClient {
   }
 
   private handleGameStateDelta(data: any): void {
+    const serverTimestamp = data.timestamp;
+    const clientReceiveTime = performance.now();
+
+    if (!this.clockSynced && serverTimestamp) {
+      this.clockOffset = serverTimestamp - clientReceiveTime;
+      this.clockSynced = true;
+    }
+
     const lastSnapshot = this.stateBuffer.getLatestSnapshot();
-    
     const newSnapshot = this.stateBuffer.cloneSnapshot(lastSnapshot);
     
-    newSnapshot.timestamp = Date.now();
+    newSnapshot.timestamp = serverTimestamp ? (serverTimestamp - this.clockOffset) : clientReceiveTime;
     
     const delta = data.delta;
     
     if (data.isFullState) {
-        newSnapshot.players.clear();
-        newSnapshot.projectiles.clear();
+      newSnapshot.players.clear();
+      newSnapshot.projectiles.clear();
     }
     
     for (const pid in delta.players) {
       if (pid === this.myPlayerId) continue; 
       newSnapshot.players.set(pid, delta.players[pid]);
     }
+    
     for (const projId in delta.projectiles) {
       newSnapshot.projectiles.set(projId, delta.projectiles[projId]);
     }
@@ -103,17 +117,19 @@ export class NetworkClient {
   }
 
   private reconcilePlayer(serverState: PlayerState, lastProcessedSeq: number): void {
-    if (lastProcessedSeq >= 0) {
-      while (this.pendingInputs.length > 0 && this.pendingInputs[0].seq <= lastProcessedSeq) {
-        this.pendingInputs.shift();
-      }
-    }
-
-    this.onReconciliationCallback?.(serverState);
+    this.onReconciliationCallback?.(serverState, lastProcessedSeq);
 
     if (this.pendingInputs.length > 0) {
       this.reconciliationCount++;
       this.lastReconciliationTime = Date.now();
+    }
+  }
+
+  public removeAcknowledgedInputs(lastProcessedSeq: number): void {
+    if (lastProcessedSeq >= 0) {
+      while (this.pendingInputs.length > 0 && this.pendingInputs[0].seq <= lastProcessedSeq) {
+        this.pendingInputs.shift();
+      }
     }
   }
 
@@ -165,7 +181,6 @@ export class NetworkClient {
     const now = Date.now();
     
     if (now - this.lastCameraUpdateTime < this.CAMERA_UPDATE_RATE) return;
-    
     if (!this.isConnected()) return;
 
     const payload = {
@@ -206,7 +221,7 @@ export class NetworkClient {
     this.onPlayerIdCallback = callback;
   }
 
-  onReconciliation(callback: (serverState: PlayerState) => void): void {
+  onReconciliation(callback: (serverState: PlayerState, lastProcessedSeq: number) => void): void {
     this.onReconciliationCallback = callback;
   }
 
