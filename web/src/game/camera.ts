@@ -1,6 +1,3 @@
-import type { PlayerState } from "../types";
-import { CAMERA_FOLLOW_SPEED } from "../utils/constants";
-
 export class Camera {
   x: number;
   y: number;
@@ -16,20 +13,17 @@ export class Camera {
     worldWidth: number, 
     worldHeight: number
   ) {
-    this.x = 0;
-    this.y = 0;
     this.width = viewportWidth;
     this.height = viewportHeight;
     this.worldWidth = worldWidth;
     this.worldHeight = worldHeight;
+    this.x = 0;
+    this.y = 0;
   }
 
-  update(player: PlayerState, deltaTime: number): void {
-    const targetX = (player.x + player.width / 2) - (this.width / 2);
-    const targetY = (player.y + player.height / 2) - (this.height / 2);
-
-    this.x += (targetX - this.x) * CAMERA_FOLLOW_SPEED * deltaTime;
-    this.y += (targetY - this.y) * CAMERA_FOLLOW_SPEED * deltaTime;
+  follow(player: { x: number, y: number, width: number, height: number }): void {
+    this.x = (player.x + player.width / 2) - (this.width / 2);
+    this.y = (player.y + player.height / 2) - (this.height / 2);
 
     this.x = Math.max(0, Math.min(this.x, this.worldWidth - this.width));
     this.y = Math.max(0, Math.min(this.y, this.worldHeight - this.height));

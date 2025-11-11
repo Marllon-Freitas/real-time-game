@@ -102,16 +102,13 @@ export class Game {
       y: lerp(this.lastPlayerState.y, this.currentPlayerState.y, interpolationAlpha),
     };
 
+    this.camera.follow(renderState);
+
     this.updateFPS();
-    this.update(renderState, deltaTime);
     this.render(renderState, currentTime);
 
     requestAnimationFrame(this.gameLoop);
   };
-
-  private update(renderState: PlayerState, deltaTime: number,): void {
-    this.camera.update(renderState, deltaTime);
-  }
 
 private fixedUpdate(fixedDeltaTime: number): void {
   let latestServerState: PlayerState | null = null;
